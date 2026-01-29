@@ -64,7 +64,8 @@ if _channel_ids:
                 logger.exception("Failed to parse CHANNEL_IDS from env/config: %r", _channel_ids)
 
 Update_Interval: int = int(_cfg.get("Update_Interval", 3600))
-
+STEAM_API_KEY = os.getenv("steam_api_key")
+BOT_TOKEN = os.getenv("bot_token")
 
 # Basic validation
 if not STEAM_API_KEY:
