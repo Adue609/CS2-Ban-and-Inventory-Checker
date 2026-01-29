@@ -41,13 +41,13 @@ CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.json")
 # _cfg = _load_config_file(CONFIG_FILE)
 
 # # Steam API key
-# STEAM_API_KEY: str = _cfg.get("steam_api_key") or os.environ.get("STEAM_API_KEY")
+STEAM_API_KEY: str #= _cfg.get("steam_api_key") or os.environ.get("STEAM_API_KEY")
 # # Discord bot token
-# BOT_TOKEN: str = _cfg.get("bot_token") or os.environ.get("DISCORD_BOT_TOKEN")
+BOT_TOKEN: str #= _cfg.get("bot_token") or os.environ.get("DISCORD_BOT_TOKEN")
 
 # # Channel IDs: prefer config file, fall back to env/CSV or JSON in env
 # _channel_ids: Any = _cfg.get("channel_ids") or os.environ.get("CHANNEL_IDS")
-# CHANNEL_IDS: List[int] = []
+CHANNEL_IDS: List[int] = []
 # if _channel_ids:
 #     if isinstance(_channel_ids, list):
 #         CHANNEL_IDS = [int(x) for x in _channel_ids]
@@ -63,7 +63,7 @@ CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.json")
 #             except Exception:
 #                 logger.exception("Failed to parse CHANNEL_IDS from env/config: %r", _channel_ids)
 
-Update_Interval: int = int(_cfg.get("Update_Interval", 3600))
+Update_Interval: int = 3600 #int(_cfg.get("Update_Interval", 3600))
 
 # Basic validation
 if not STEAM_API_KEY:
