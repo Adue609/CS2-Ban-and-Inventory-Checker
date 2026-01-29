@@ -88,4 +88,5 @@ if not CHANNEL_IDS:
         logger.warning("No channel IDs configured (CONFIG_FILE=%s). CHANNEL_IDS is empty.", CONFIG_FILE)
         pass
 
+
 logger.info("Configuration loaded: Update_Interval=%d seconds, CHANNEL_IDS=%r", Update_Interval, CHANNEL_IDS)
