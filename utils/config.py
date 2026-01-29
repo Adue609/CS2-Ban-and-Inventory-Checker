@@ -88,4 +88,4 @@ if not CHANNEL_IDS:
         pass
 
 
-logger.info("Configuration loaded: Update_Interval=%d seconds, CHANNEL_IDS=%r", Update_Interval, CHANNEL_IDS)
+#logger.info("Configuration loaded: Update_Interval=%d seconds, CHANNEL_IDS=%r", Update_Interval, CHANNEL_IDS)
