@@ -21,7 +21,7 @@ def _load_config_file(path: str) -> dict:
             "steam_api_key": "",
             "bot_token": "",
             "channel_ids": [],
-            "Update_Interval": 1 * 24 * 60 * 60  # 1 days (epoch seconds)
+            "Update_Interval": 1 * 1 * 60 * 60  # 1 days (epoch seconds)
         }
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -69,13 +69,23 @@ Update_Interval: int = int(_cfg.get("Update_Interval", 3600))
 # Basic validation
 if not STEAM_API_KEY:
     logger.error("Missing Steam API key. Set 'steam_api_key' in %s or STEAM_API_KEY env var", CONFIG_FILE)
-    raise SystemExit(1)
+    try:
+        os.getenv("steam_api_key")
+    except:
+        raise SystemExit(1)
 
 if not BOT_TOKEN:
     logger.error("Missing Discord bot token. Set 'bot_token' in %s or DISCORD_BOT_TOKEN env var", CONFIG_FILE)
-    raise SystemExit(1)
+    try:
+        os.getenv("bot_token")
+    except:
+        raise SystemExit(1)
 
 if not CHANNEL_IDS:
     logger.warning("No channel IDs configured (CONFIG_FILE=%s). CHANNEL_IDS is empty.", CONFIG_FILE)
+    try:
+        os.getenv("channel_ids")
+    except:
+        pass
 
 logger.info("Configuration loaded: Update_Interval=%d seconds, CHANNEL_IDS=%r", Update_Interval, CHANNEL_IDS)
