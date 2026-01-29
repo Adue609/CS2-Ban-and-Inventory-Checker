@@ -68,24 +68,24 @@ Update_Interval: int = int(_cfg.get("Update_Interval", 3600))
 
 # Basic validation
 if not STEAM_API_KEY:
-    logger.error("Missing Steam API key. Set 'steam_api_key' in %s or STEAM_API_KEY env var", CONFIG_FILE)
     try:
         os.getenv("steam_api_key")
     except:
+        logger.error("Missing Steam API key. Set 'steam_api_key' in %s or STEAM_API_KEY env var", CONFIG_FILE)
         raise SystemExit(1)
 
 if not BOT_TOKEN:
-    logger.error("Missing Discord bot token. Set 'bot_token' in %s or DISCORD_BOT_TOKEN env var", CONFIG_FILE)
     try:
         os.getenv("bot_token")
     except:
+        logger.error("Missing Discord bot token. Set 'bot_token' in %s or DISCORD_BOT_TOKEN env var", CONFIG_FILE)
         raise SystemExit(1)
 
 if not CHANNEL_IDS:
-    logger.warning("No channel IDs configured (CONFIG_FILE=%s). CHANNEL_IDS is empty.", CONFIG_FILE)
     try:
         CHANNEL_IDS = [int(x) for x in os.getenv("channel_ids", "").split(",") if x]
     except:
+        logger.warning("No channel IDs configured (CONFIG_FILE=%s). CHANNEL_IDS is empty.", CONFIG_FILE)
         pass
 
 logger.info("Configuration loaded: Update_Interval=%d seconds, CHANNEL_IDS=%r", Update_Interval, CHANNEL_IDS)
