@@ -84,7 +84,7 @@ if not BOT_TOKEN:
 if not CHANNEL_IDS:
     logger.warning("No channel IDs configured (CONFIG_FILE=%s). CHANNEL_IDS is empty.", CONFIG_FILE)
     try:
-        os.getenv("channel_ids")
+        CHANNEL_IDS = [int(x) for x in os.getenv("channel_ids", "").split(",") if x]
     except:
         pass
 
