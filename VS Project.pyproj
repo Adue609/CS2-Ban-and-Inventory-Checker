@@ -41,7 +41,10 @@
     <Folder Include="utils\" />
   </ItemGroup>
   <ItemGroup>
+    <Content Include="build_exe.bat" />
     <Content Include="config.json" />
+    <Content Include="gitignore .gitignore" />
+    <Content Include="input_messages.json" />
     <Content Include="Procfile" />
     <Content Include="requirements.txt" />
   </ItemGroup>

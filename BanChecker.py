@@ -5,6 +5,8 @@ import requests
 import time
 import asyncio
 import random
+import os
+import json
 
 from utils.logger import get_logger
 from utils.PriceChecker import get_market_price_from_cache
@@ -48,17 +50,20 @@ async def on_ready():
     # refresh_inventories_task.start()
 
 def check_steam_profile(steam_id):
-    url = f'http://api.steampowered.com/ISteamUser/GetPlayerBans/v1/?key={STEAM_API_KEY}&steamids={steam_id}'
+    api_key = (STEAM_API_KEY or "").strip()
+    url = "https://api.steampowered.com/ISteamUser/GetPlayerBans/v1/"
+    params = {"key": api_key, "steamids": steam_id}
+
     try:
-        logger.debug("Checking bans for SteamID=%s via %s", steam_id, url)
-        response = STEAM_SESSION.get(url, timeout=10)
+        logger.debug("Checking bans for SteamID=%s via %s params=%s", steam_id, url, {"steamids": steam_id})
+        response = STEAM_SESSION.get(url, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
-        if data.get('players'):
-            return data['players'][0]
+        if data.get("players"):
+            return data["players"][0]
         return None
     except Exception as e:
-        logger.exception("Unexpected error checking bans for SteamID=%s, error = %s", steam_id, e)
+        logger.exception("Unexpected error checking bans for SteamID=%s, error=%s", steam_id, e)
         return None
 
 def normalize_steam_profile_link(link):
@@ -271,7 +276,166 @@ def parse_inventory_total(inventory_text):
     total = sum(p * c for p, c in totals.values())
     return total
 
-@tasks.loop(minutes=60)
+INPUT_FILE = "input_messages.json"
+RUNTIME_INPUT_TIMEOUT_SECONDS = 30
+STEAM_LINK_PATTERN = re.compile(r'https?://steamcommunity\.com/(profiles|id)/(\w+)(?:/(\w+))?')
+
+
+def _normalize_messages(messages: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for m in messages:
+        if not isinstance(m, str):
+            continue
+        value = m.strip()
+        if not value:
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def save_input_messages(messages: list[str], file_path: str = INPUT_FILE) -> None:
+    new_items = _normalize_messages(messages)
+    if not new_items:
+        return
+
+    existing_items = load_input_messages(file_path)
+    merged = _normalize_messages(existing_items + new_items)
+
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(merged, f, indent=2)
+        logger.info("Saved %d new input message(s), total=%d in %s", len(new_items), len(merged), file_path)
+    except Exception:
+        logger.exception("Failed to save input messages to %s", file_path)
+
+
+def load_input_messages(file_path: str = INPUT_FILE) -> list[str]:
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        logger.warning("Input file not found: %s", file_path)
+        return []
+    except json.JSONDecodeError:
+        logger.exception("Invalid JSON in input file: %s", file_path)
+        return []
+    except Exception:
+        logger.exception("Failed to read input file: %s", file_path)
+        return []
+
+    messages: list[str] = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str):
+                messages.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("content"), str):
+                messages.append(item["content"])
+    elif isinstance(data, dict):
+        raw = data.get("messages", [])
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str):
+                    messages.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("content"), str):
+                    messages.append(item["content"])
+
+    messages = _normalize_messages(messages)
+    logger.info("Loaded %d input message(s) from %s", len(messages), file_path)
+    return messages
+
+
+async def collect_runtime_messages_and_save(timeout_seconds: int = RUNTIME_INPUT_TIMEOUT_SECONDS) -> list[str]:
+    logger.info("Runtime input enabled. Enter multiple lines. Press Enter on empty line to finish.")
+    logger.info("If no input for %ss, it will fallback to %s", timeout_seconds, INPUT_FILE)
+
+    runtime_messages: list[str] = []
+
+    while True:
+        try:
+            line = await asyncio.wait_for(
+                asyncio.to_thread(input, "Input Steam link/message: "),
+                timeout=timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            break
+        except Exception:
+            logger.exception("Failed to read runtime input")
+            break
+
+        line = (line or "").strip()
+        if not line:
+            break
+
+        if STEAM_LINK_PATTERN.search(line):
+            runtime_messages.append(line)
+        else:
+            logger.warning("Ignored invalid input (does not match Steam link format): %s", line)
+
+    runtime_messages = _normalize_messages(runtime_messages)
+    if runtime_messages:
+        save_input_messages(runtime_messages, INPUT_FILE)
+
+    return runtime_messages
+            
+def parse_runtime_input(raw: str) -> list[str]:
+    text = (raw or "").strip()
+    if not text:
+        return []
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return _normalize_runtime_items([str(x) for x in parsed])
+    except Exception:
+        pass
+
+    cleaned = text.strip().removeprefix("[").removesuffix("]")
+    parts = re.split(r"[\n,]+", cleaned)
+    return _normalize_runtime_items(parts)
+
+
+async def get_runtime_messages(timeout_seconds: int = RUNTIME_INPUT_TIMEOUT_SECONDS) -> list[str]:
+    prompt = (
+        "Enter Steam links now (JSON list, comma-separated, or newline-separated). "
+        f"Waiting {timeout_seconds}s, then fallback to {INPUT_FILE}: "
+    )
+    try:
+        raw = await asyncio.wait_for(asyncio.to_thread(input, prompt), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        logger.info("No runtime input received within %ss", timeout_seconds)
+        return []
+    except Exception:
+        logger.exception("Failed to read runtime input")
+        return []
+
+    messages = parse_runtime_input(raw)
+    if messages:
+        logger.info("Loaded %d input message(s) from runtime input", len(messages))
+    return messages
+
+
+async def load_messages_runtime_or_file(timeout_seconds: int = RUNTIME_INPUT_TIMEOUT_SECONDS) -> list[str]:
+    runtime_messages = await get_runtime_messages(timeout_seconds)
+    if runtime_messages:
+        return runtime_messages
+
+    return load_input_messages(INPUT_FILE)
+
+def _normalize_runtime_items(items: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for item in items:
+        value = str(item).strip().strip('"').strip("'").rstrip(",")
+        if not value:
+            continue
+        if STEAM_LINK_PATTERN.search(value):
+            normalized.append(value)
+    return _normalize_messages(normalized)
+
+@tasks.loop(minutes=90)
 async def check_steam():
     logger.info("check_steam task started")
     for channel_id in CHANNEL_IDS:
@@ -287,12 +451,22 @@ async def check_steam():
 
         await delete_previous_bot_messages(channel)
 
-        async for message in channel.history(limit=100):
-            steam_links = re.findall(r'https?://steamcommunity\.com/(profiles|id)/(\w+)(?:/(\w+))?',message.content)
+        input_messages = await collect_runtime_messages_and_save()
+        if not input_messages:
+            input_messages = load_input_messages()
+
+        if not input_messages:
+            logger.warning("No input messages found from runtime input or %s", INPUT_FILE)
+            continue
+
+        for msg_idx, content in enumerate(input_messages, start=1):
+            steam_links = re.findall(r'https?://steamcommunity\.com/(profiles|id)/(\w+)(?:/(\w+))?', content)
             if not steam_links:
                 continue
+
             total_accounts_found += len(steam_links)
-            logger.debug("Found %d steam links in message %s", len(steam_links), message.id)
+            logger.debug("Found %d steam links in input message #%d", len(steam_links), msg_idx)
+
             for profile_type, profile_id, group in steam_links:
                 group = group or "UNGROUPED"
                 full_link = f'https://steamcommunity.com/{profile_type}/{profile_id}'
@@ -301,48 +475,50 @@ async def check_steam():
                 logger.debug("Normalized %s -> steam_id=%s original=%s", full_link, steam_id, original_id)
 
                 if steam_id:
-                  profile_status = await asyncio.to_thread(check_steam_profile, steam_id)
-                  if profile_status:
-                      vac_banned = profile_status['VACBanned']
-                      community_banned = profile_status['CommunityBanned']
-                      game_ban_count = profile_status['NumberOfGameBans']
-                      inventory_info = await asyncio.to_thread(get_inventory_summary, steam_id, 730, 2, True)
+                    profile_status = await asyncio.to_thread(check_steam_profile, steam_id)
+                    if profile_status:
+                        vac_banned = profile_status['VACBanned']
+                        community_banned = profile_status['CommunityBanned']
+                        game_ban_count = profile_status['NumberOfGameBans']
+                        inventory_info = await asyncio.to_thread(get_inventory_summary, steam_id, 730, 2, True)
 
-                      inv_total = parse_inventory_total(inventory_info)
-                      group_totals[group] = group_totals.get(group, 0.0) + inv_total
-                      logger.debug("Added $%.2f to group %s (profile=%s)", inv_total, group, steam_id)
+                        inv_total = parse_inventory_total(inventory_info)
+                        group_totals[group] = group_totals.get(group, 0.0) + inv_total
+                        logger.debug("Added $%.2f to group %s (profile=%s)", inv_total, group, steam_id)
 
-                      profile_info = (
-                        f"Original ID: {full_link}\n"
-                        f"`Steam ID:` {steam_id}\n"
-                        f"```{inventory_info}```"
-                      )
+                        profile_info = (
+                            f"Original ID: {full_link}\n"
+                            f"`Steam ID:` {steam_id}\n"
+                            f"```{inventory_info}```"
+                        )
 
-                      profile_info_NotBanned = (
-                        f"Original ID: {full_link}\n"
-                        f"```{inventory_info}```"
-                      )
+                        profile_info_NotBanned = (
+                            f"Original ID: {full_link}\n"
+                            f"```{inventory_info}```"
+                        )
 
-                      if vac_banned:
-                          add_to_group(vac_banned_accounts, group, profile_info)
-                      if community_banned:
-                          add_to_group(community_banned_accounts, group, profile_info)
-                      if game_ban_count > 0:
-                          add_to_group(game_banned_accounts,group,f"{profile_info} - {game_ban_count} Game Ban(s)")
-                      if not (vac_banned or community_banned or game_ban_count > 0):
-                          add_to_group(not_banned_accounts, group, profile_info_NotBanned)
-                  else:
-                      add_to_group(not_banned_accounts,group,f"Original ID: {full_link} (Steam ID: {steam_id}) - Could not retrieve data")
-                      logger.warning("Could not retrieve profile status for steam_id=%s", steam_id)
+                        if vac_banned:
+                            add_to_group(vac_banned_accounts, group, profile_info)
+                        if community_banned:
+                            add_to_group(community_banned_accounts, group, profile_info)
+                        if game_ban_count > 0:
+                            add_to_group(game_banned_accounts, group, f"{profile_info} - {game_ban_count} Game Ban(s)")
+                        if not (vac_banned or community_banned or game_ban_count > 0):
+                            add_to_group(not_banned_accounts, group, profile_info_NotBanned)
+                    else:
+                        add_to_group(not_banned_accounts, group, f"Original ID: {full_link} (Steam ID: {steam_id}) - Could not retrieve data")
+                        logger.warning("Could not retrieve profile status for steam_id=%s", steam_id)
                 else:
-                    add_to_group(invalid_accounts,group,f"Invalid or unresolvable Steam link: {full_link}")
+                    add_to_group(invalid_accounts, group, f"Invalid or unresolvable Steam link: {full_link}")
                     logger.warning("Invalid/unresolvable Steam link: %s", full_link)
 
-        logger.info("Channel %s summary: total_found=%d vac_groups=%d community_groups=%d game_groups=%d not_banned_groups=%d invalid_groups=%d",
-                    channel_id, total_accounts_found,
-                    len(vac_banned_accounts), len(community_banned_accounts),
-                    len(game_banned_accounts), len(not_banned_accounts),
-                    len(invalid_accounts))
+        logger.info(
+            "Channel %s summary: total_found=%d vac_groups=%d community_groups=%d game_groups=%d not_banned_groups=%d invalid_groups=%d",
+            channel_id, total_accounts_found,
+            len(vac_banned_accounts), len(community_banned_accounts),
+            len(game_banned_accounts), len(not_banned_accounts),
+            len(invalid_accounts)
+        )
 
         await send_grouped_embeds(channel, "VAC Banned Accounts", vac_banned_accounts, total_accounts_found)
         await send_grouped_embeds(channel, "Community Banned Accounts", community_banned_accounts, total_accounts_found)

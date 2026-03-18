@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[codz]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+.Python
+wheels/
+pip-wheel-metadata/
+
+# PyInstaller
+*.spec
+*.manifest
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+
+# Logs
+*.log
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Runtime data / secrets
+config.json
+dist/config.json
+inventory_cache.json
+cs_prices.json
+input_messages.json
+
+# Keep templates tracked
+!config.example.json
+!input_messages.example.json

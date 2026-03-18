@@ -77,6 +77,10 @@ def fetch_inventory(steam_id: str, appid: int = 730, contextid: int = 2) -> str:
             time.sleep(backoff)
             continue
 
+        if r.status_code in (401, 403):
+            logger.warning("Inventory unauthorized/forbidden for %s (status=%d). Skipping retries.", steam_id, r.status_code)
+            return "Inventory private or unauthorized"
+
         if r.status_code != 200:
             logger.warning("Inventory request for %s returned status %s", steam_id, r.status_code)
             time.sleep(5)
@@ -145,7 +149,7 @@ def fetch_inventory(steam_id: str, appid: int = 730, contextid: int = 2) -> str:
         lines = []
         for v in market_totals.values():
             qty_str = f" x{v['count']}" if v['count'] > 1 else ""
-            lines.append(f"{v['name']}{qty_str} - {v['price']}")# T={v['tradable']} M={v['marketable']}")
+            lines.append(f"{v['name']}{qty_str} - {v['price']}")
 
         return "Items:\n" + "\n".join(lines)
 
