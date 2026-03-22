@@ -46,7 +46,7 @@ Create `config.json` in the project root:
 {
   "steam_api_key": "YOUR_STEAM_API_KEY",
   "bot_token": "YOUR_DISCORD_BOT_TOKEN",
-  "channel_ids": ["YOUR_CHANNEL_ID"],
+  "channel_ids": ["YOUR_DISCORD_CHANNEL_ID"],
   "Update_Interval": 3600
 }
 ```
@@ -131,33 +131,46 @@ Regenerates `requirements.txt` from the same active environment before build.
 - Cache files are generated at runtime (`inventory_cache.json`, `cs_prices.json`).
 - Do not commit secrets (`config.json`, bot token, API keys) to source control.
 
-## Screenshots
+## Runtime Behavior
 
-![App Screenshot](https://via.placeholder.com/468x300?text=App+Screenshot+Here)
+- `check_steam` runs every **90 minutes**.
+- Runtime input is accepted first (interactive console).
+- If no runtime input is provided in time, the bot falls back to `input_messages.json`.
+- Input entries can include optional group suffixes in URL form:
+  - `https://steamcommunity.com/profiles/<steamid>/<GROUP>`
+  - `https://steamcommunity.com/id/<vanity>/<GROUP>`
 
-## Documentation
+## Discord Setup
 
-[Documentation](https://linktodocumentation)
+Enable these in Discord Developer Portal:
 
-## FAQ
+- **MESSAGE CONTENT INTENT** (required)
+- Bot permissions in target channel:
+  - Read Message History
+  - Read Messages/View Channels
+  - Send Messages
+  - Embed Links
+  - Manage Messages (for cleanup of previous bot messages)
 
-#### Question 1
+## First Run Notes
 
-Answer 1
+- If `config.json` does not exist, the app creates a template file.
+- You must fill valid values in `config.json` before the bot can start.
 
-#### Question 2
+## EXE Notes
 
-Answer 2
+- JSON/cache files (`config.json`, `inventory_cache.json`, `cs_prices.json`, `input_messages.json`) are runtime files.
+- They are expected/created in the same directory as the executable (or working directory).
 
-## Roadmap
+## Error Handling Notes
 
-- Add a compiled version of the script with CLI terminal.
-- Add GUI to the script.
-- Add support for different apps like Telegram and WhatsApp.
+- Steam inventory `401/403` responses are treated as private/unauthorized and retries are skipped.
+- Ban API `403` usually indicates an invalid or malformed Steam API key.
 
-## 🚀 About Me
+## Security
 
-I'm a full stack developer...
+- Do not commit `config.json` with real keys/tokens.
+- If a Discord token was ever exposed, regenerate it immediately in the Discord Developer Portal.
 
 ## License
 
