@@ -40,15 +40,13 @@ Current `requirements.txt`:
 
 ## Configuration
 
-The app uses `config.json` in the project root.
-
-Example:
+Create `config.json` in the project root:
 
 ```json
 {
   "steam_api_key": "YOUR_STEAM_API_KEY",
   "bot_token": "YOUR_DISCORD_BOT_TOKEN",
-  "channel_ids": [1458480444579254272],
+  "channel_ids": ["YOUR_CHANNEL_ID"],
   "Update_Interval": 3600
 }
 ```
@@ -93,7 +91,6 @@ Double-click:
 or run:
 
     build_exe.bat
-
 
 This script:
 
