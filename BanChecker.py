@@ -164,48 +164,74 @@ async def send_embed(channel, title, accounts, total_accounts_found):
         logger.debug("No accounts to send for embed title=%s", title)
         return
 
-    total_accounts_printed = 0
     chunks = chunk_list(accounts)
     embed = discord.Embed(title=title, color=0x1e90ff)
     fields_in_current = 0
     part_index = 1
+    printed_in_current = 0
+
+    def estimate_embed_size(e: discord.Embed) -> int:
+        size = 0
+        size += len(e.title or "")
+        size += len(e.description or "")
+        if e.footer and e.footer.text:
+            size += len(e.footer.text)
+        if e.author and e.author.name:
+            size += len(e.author.name)
+        for f in e.fields:
+            size += len(f.name or "") + len(f.value or "")
+        return size
 
     async def send_and_reset(current_embed, printed_so_far):
         try:
-            current_embed.add_field(name="Summary", value=f"Total accounts printed (this embed): {printed_so_far}", inline=False)
+            # Use footer instead of summary field (safer for 6000-char limit)
+            current_embed.set_footer(
+                text=f"Printed in this embed: {printed_so_far} / Found: {total_accounts_found}"
+            )
             await channel.send(embed=current_embed)
-            logger.info("Sent embed '%s' to channel %s (printed=%d, found=%d)", title, channel.id if channel else "unknown", printed_so_far, total_accounts_found)
+            logger.info(
+                "Sent embed '%s' to channel %s (printed=%d, found=%d)",
+                title,
+                channel.id if channel else "unknown",
+                printed_so_far,
+                total_accounts_found
+            )
         except Exception:
-            logger.exception("Failed to send embed '%s' to channel %s", title, channel.id if channel else "unknown")
-
-    printed_in_current = 0
+            logger.exception(
+                "Failed to send embed '%s' to channel %s",
+                title,
+                channel.id if channel else "unknown"
+            )
 
     for chunk_str, count in chunks:
-        if fields_in_current >= EMBED_MAX_FIELDS - 1:
-            await send_and_reset(embed, printed_in_current)
-            embed = discord.Embed(title=title, color=0x1e90ff)
-            fields_in_current = 0
-            printed_in_current = 0
-
         value = chunk_str
+        field_name = f"{title} (Part {part_index})"
+
+        if len(field_name) > EMBED_FIELD_NAME_LIMIT:
+            field_name = field_name[:EMBED_FIELD_NAME_LIMIT - 3] + "..."
         if len(value) > EMBED_FIELD_VALUE_LIMIT:
             value = value[:EMBED_FIELD_VALUE_LIMIT - 3] + "..."
 
-        field_name = f"{title} (Part {part_index})"
-        if len(field_name) > EMBED_FIELD_NAME_LIMIT:
-            field_name = field_name[:EMBED_FIELD_NAME_LIMIT - 3] + "..."
-        embed.add_field(name=field_name, value=value, inline=False)
-        fields_in_current += 1
-        total_accounts_printed += count
-        printed_in_current += count
-        part_index += 1
-
-        est_size = len(embed.title or "") + sum(len(f.value) if hasattr(f, "value") else 0 for f in embed.fields)
-        if est_size > EMBED_TOTAL_CHAR_LIMIT - 500:
+        # Field count hard limit
+        if fields_in_current >= EMBED_MAX_FIELDS:
             await send_and_reset(embed, printed_in_current)
             embed = discord.Embed(title=title, color=0x1e90ff)
             fields_in_current = 0
             printed_in_current = 0
+
+        # Total char hard limit (reserve space for footer text)
+        footer_reserved = 80
+        projected = estimate_embed_size(embed) + len(field_name) + len(value) + footer_reserved
+        if projected > EMBED_TOTAL_CHAR_LIMIT and fields_in_current > 0:
+            await send_and_reset(embed, printed_in_current)
+            embed = discord.Embed(title=title, color=0x1e90ff)
+            fields_in_current = 0
+            printed_in_current = 0
+
+        embed.add_field(name=field_name, value=value, inline=False)
+        fields_in_current += 1
+        printed_in_current += count
+        part_index += 1
 
     if fields_in_current > 0:
         await send_and_reset(embed, printed_in_current)
