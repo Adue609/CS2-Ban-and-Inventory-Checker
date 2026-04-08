@@ -305,6 +305,7 @@ def parse_inventory_total(inventory_text):
 INPUT_FILE = "input_messages.json"
 RUNTIME_INPUT_TIMEOUT_SECONDS = 30
 STEAM_LINK_PATTERN = re.compile(r'https?://steamcommunity\.com/(profiles|id)/(\w+)(?:/(\w+))?')
+INPUT_FILE_CANDIDATE_NAMES = {"input_message.json", "input_messages.json"}
 
 
 def _normalize_messages(messages: list[str]) -> list[str]:
@@ -339,20 +340,7 @@ def save_input_messages(messages: list[str], file_path: str = INPUT_FILE) -> Non
         logger.exception("Failed to save input messages to %s", file_path)
 
 
-def load_input_messages(file_path: str = INPUT_FILE) -> list[str]:
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        logger.warning("Input file not found: %s", file_path)
-        return []
-    except json.JSONDecodeError:
-        logger.exception("Invalid JSON in input file: %s", file_path)
-        return []
-    except Exception:
-        logger.exception("Failed to read input file: %s", file_path)
-        return []
-
+def _extract_messages_from_json_payload(data) -> list[str]:
     messages: list[str] = []
     if isinstance(data, list):
         for item in data:
@@ -368,10 +356,66 @@ def load_input_messages(file_path: str = INPUT_FILE) -> list[str]:
                     messages.append(item)
                 elif isinstance(item, dict) and isinstance(item.get("content"), str):
                     messages.append(item["content"])
+    return _normalize_messages(messages)
 
-    messages = _normalize_messages(messages)
+
+def load_input_messages(file_path: str = INPUT_FILE) -> list[str]:
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        logger.warning("Input file not found: %s", file_path)
+        return []
+    except json.JSONDecodeError:
+        logger.exception("Invalid JSON in input file: %s", file_path)
+        return []
+    except Exception:
+        logger.exception("Failed to read input file: %s", file_path)
+        return []
+
+    messages = _extract_messages_from_json_payload(data)
     logger.info("Loaded %d input message(s) from %s", len(messages), file_path)
     return messages
+
+
+async def hydrate_input_messages_from_discord(channel, file_path: str = INPUT_FILE) -> list[str]:
+    local_messages = load_input_messages(file_path)
+    if local_messages:
+        return local_messages
+
+    if channel is None:
+        logger.warning("Cannot hydrate %s from Discord: channel is None", file_path)
+        return []
+
+    logger.info("Local %s is empty/missing. Trying to fetch from Discord channel %s", file_path, channel.id)
+    try:
+        async for message in channel.history(limit=200):
+            for attachment in message.attachments:
+                if attachment.filename.lower() not in INPUT_FILE_CANDIDATE_NAMES:
+                    continue
+
+                try:
+                    payload = await attachment.read()
+                    data = json.loads(payload.decode("utf-8"))
+                    messages = _extract_messages_from_json_payload(data)
+                    if not messages:
+                        logger.warning("Attachment %s found but no valid messages inside", attachment.filename)
+                        continue
+
+                    save_input_messages(messages, file_path)
+                    logger.info(
+                        "Hydrated %d input message(s) from Discord attachment %s",
+                        len(messages),
+                        attachment.filename
+                    )
+                    return messages
+                except Exception:
+                    logger.exception("Failed reading/parsing Discord attachment %s", attachment.filename)
+    except Exception:
+        logger.exception("Failed to scan channel history for %s", file_path)
+
+    logger.warning("No usable %s attachment found in Discord history", file_path)
+    return []
 
 
 async def collect_runtime_messages_and_save(timeout_seconds: int = RUNTIME_INPUT_TIMEOUT_SECONDS) -> list[str]:
@@ -475,6 +519,11 @@ async def check_steam():
         group_totals = {}
         total_accounts_found = 0
 
+        if channel is None:
+            logger.warning("Channel %s not found", channel_id)
+            continue
+
+        await hydrate_input_messages_from_discord(channel, INPUT_FILE)
         await delete_previous_bot_messages(channel)
 
         input_messages = await collect_runtime_messages_and_save()

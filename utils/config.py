@@ -31,15 +31,42 @@ def _load_config_file(path: str) -> dict:
 
 _cfg = _load_config_file(CONFIG_FILE)
 
+
+def _parse_positive_int(raw_value, default: int, field_name: str) -> int:
+    try:
+        value = int(raw_value)
+        if value <= 0:
+            raise ValueError
+        return value
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s in %s. Using default=%d", field_name, CONFIG_FILE, default)
+        return default
+
+
+def _parse_channel_ids(raw_value) -> List[int]:
+    if not isinstance(raw_value, list):
+        logger.warning("Invalid channel_ids in %s. Expected list.", CONFIG_FILE)
+        return []
+
+    parsed: List[int] = []
+    for idx, item in enumerate(raw_value):
+        try:
+            parsed.append(int(item))
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid channel_ids[%d]=%r in %s", idx, item, CONFIG_FILE)
+    return parsed
+
 STEAM_API_KEY: str = (_cfg.get("steam_api_key") or "").strip()
 BOT_TOKEN: str = (_cfg.get("bot_token") or "").strip()
-CHANNEL_IDS: List[int] = [int(x) for x in (_cfg.get("channel_ids") or [])]
-Update_Interval: int = int(_cfg.get("Update_Interval", 3600))
+CHANNEL_IDS: List[int] = _parse_channel_ids(_cfg.get("channel_ids"))
+UPDATE_INTERVAL: int = _parse_positive_int(_cfg.get("Update_Interval", 3600), 3600, "Update_Interval")
+# Backward-compatible alias for existing imports
+Update_Interval: int = UPDATE_INTERVAL
 
 if not STEAM_API_KEY:
-    logger.error("Missing steam_api_key in config.json")
+    logger.error("Missing steam_api_key in %s", CONFIG_FILE)
     raise SystemExit(1)
 
 if not BOT_TOKEN:
-    logger.error("Missing bot_token in config.json")
+    logger.error("Missing bot_token in %s", CONFIG_FILE)
     raise SystemExit(1)
