@@ -1,17 +1,19 @@
-﻿import discord
+import discord
 from discord.ext import commands, tasks
 import re
 import requests
 import time
 import asyncio
 import random
-import os
 import json
+import tkinter as tk
+import threading
 
 from utils.logger import get_logger
-from utils.PriceChecker import get_market_price_from_cache
-from utils.Inventory import get_inventory_summary
+from utils.Inventory import get_inventory_summary_with_status, remove_cache_entry, get_unchanged_inventory_ids, remove_unchanged_inventory, set_stop_requested, is_stop_requested
 from utils.config import STEAM_API_KEY, BOT_TOKEN, CHANNEL_IDS
+from utils.gui import create_gui_window, setup_gui_logging, reset_inventory_progress, mark_inventory_processed
+from utils.PriceChecker import force_update_all_prices
 
 logger = get_logger("BanChecker")
 
@@ -30,9 +32,12 @@ STEAM_HEADERS = {
     "Referer": "https://steamcommunity.com/",
     "Connection": "keep-alive",
 }
+STEAM_SESSION.headers.update(STEAM_HEADERS)
 
-INVENTORY_MAX_RETRIES = 10
-INVENTORY_BACKOFF_BASE = 1.5
+BAN_API_MAX_RETRIES = 5
+BAN_API_BACKOFF_BASE = 1.5
+BAN_API_BACKOFF_CAP = 6.0
+STEAM_429_DELAY_SECONDS = 30
 
 # @tasks.loop(seconds=UPDATE_INTERVAL)
 # async def refresh_inventories_task():
@@ -42,36 +47,134 @@ EMBED_FIELD_VALUE_LIMIT = 1024
 EMBED_FIELD_NAME_LIMIT = 256
 EMBED_TOTAL_CHAR_LIMIT = 6000
 EMBED_MAX_FIELDS = 25
+MAX_CONCURRENT_PROFILE_CHECKS = 4
+CHECK_LOOP_INTERVAL_SECONDS = 60 * 60
+
+_runtime_input_bootstrapped = False
+_runtime_input_messages_cache = []
+_continuous_worker_started = False
+_bot_paused = False
+_bot_running = False
+_bot_started_by_gui = False
+_gui_window: tk.Tk = None
+_gui_ready = False
+_bot_ready = asyncio.Event()  # Signal when bot event loop is ready
+_active_tasks = set()  # Track active profile processing tasks
 
 @bot.event
 async def on_ready():
+    global _continuous_worker_started, _bot_started_by_gui, _gui_ready, _bot_ready
     logger.info("Bot ready. Logged in as %s", bot.user)
-    check_steam.start()
-    # refresh_inventories_task.start()
+    
+    # Signal that bot event loop is ready
+    if not _bot_ready.is_set():
+        _bot_ready.set()
+    
+    # Only auto-start if GUI isn't managing the bot
+    if not _continuous_worker_started and not _gui_ready:
+        logger.info("GUI not active, auto-starting check loop")
+        check_steam.start()
+        _continuous_worker_started = True
+        _bot_running = True
+        logger.info(
+            "Started continuous check loop interval=%ss",
+            CHECK_LOOP_INTERVAL_SECONDS,
+        )
+    elif not _continuous_worker_started and _gui_ready:
+        logger.info("GUI is active, waiting for GUI commands to start check loop")
+        _continuous_worker_started = True
 
 def check_steam_profile(steam_id):
+    if is_stop_requested():
+        logger.info("Stop requested; skipping ban check for SteamID=%s", steam_id)
+        return None
     api_key = (STEAM_API_KEY or "").strip()
     url = "https://api.steampowered.com/ISteamUser/GetPlayerBans/v1/"
     params = {"key": api_key, "steamids": steam_id}
 
-    try:
-        logger.debug("Checking bans for SteamID=%s via %s params=%s", steam_id, url, {"steamids": steam_id})
-        response = STEAM_SESSION.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("players"):
-            return data["players"][0]
-        return None
-    except Exception as e:
-        logger.exception("Unexpected error checking bans for SteamID=%s, error=%s", steam_id, e)
+    for attempt in range(BAN_API_MAX_RETRIES):
+        if is_stop_requested():
+            logger.info("Stop requested; aborting ban check for SteamID=%s", steam_id)
+            return None
+        try:
+            logger.debug("Checking bans for SteamID=%s via %s params=%s", steam_id, url, {"steamids": steam_id})
+            response = STEAM_SESSION.get(url, params=params, timeout=10)
+        except requests.exceptions.RequestException:
+            wait_s = min(BAN_API_BACKOFF_CAP, BAN_API_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 1))
+            logger.warning(
+                "Request error checking bans for SteamID=%s (attempt=%d/%d). Retrying in %.1fs",
+                steam_id,
+                attempt + 1,
+                BAN_API_MAX_RETRIES,
+                wait_s,
+            )
+            time.sleep(wait_s)
+            continue
+
+        if response.status_code == 200:
+            try:
+                data = response.json()
+            except ValueError:
+                logger.warning("Invalid JSON in ban response for SteamID=%s", steam_id)
+                return None
+
+            if data.get("players"):
+                return data["players"][0]
+            return None
+
+        if response.status_code == 429:
+            logger.warning(
+                "Steam ban API rate-limited for SteamID=%s (attempt=%d/%d). Sleeping %ss",
+                steam_id,
+                attempt + 1,
+                BAN_API_MAX_RETRIES,
+                STEAM_429_DELAY_SECONDS,
+            )
+            time.sleep(STEAM_429_DELAY_SECONDS)
+            continue
+
+        if response.status_code in (420, 500, 502, 503, 504):
+            retry_after = response.headers.get("Retry-After")
+            try:
+                retry_after_s = float(retry_after) if retry_after is not None else 0.0
+            except ValueError:
+                retry_after_s = 0.0
+
+            wait_s = min(
+                BAN_API_BACKOFF_CAP,
+                max(retry_after_s, BAN_API_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 1)),
+            )
+            logger.warning(
+                "Steam ban API throttled/unavailable for SteamID=%s (status=%d, attempt=%d/%d). Retrying in %.1fs",
+                steam_id,
+                response.status_code,
+                attempt + 1,
+                BAN_API_MAX_RETRIES,
+                wait_s,
+            )
+            time.sleep(wait_s)
+            continue
+
+        logger.warning(
+            "Non-retryable ban API status for SteamID=%s: status=%d",
+            steam_id,
+            response.status_code,
+        )
         return None
 
+    logger.warning("Exhausted ban API retries for SteamID=%s", steam_id)
+    return None
+
 def normalize_steam_profile_link(link):
+    if is_stop_requested():
+        logger.info("Stop requested; skipping profile normalization for link=%s", link)
+        return None, None
     specific_profile_link = 'https://steamcommunity.com/profiles/76561198063578000/'
     specific_profile_id = '71111111111111111'
     specific_custom_id = 'MehdiCRisH'
 
     if link in [specific_profile_link, f'https://steamcommunity.com/id/{specific_custom_id}/']:
+        logger.debug("Matched hardcoded profile mapping for link=%s", link)
         return specific_profile_id, specific_custom_id
     else:
         match = re.match(r'https?://steamcommunity\.com/(profiles|id)/(\w+)/?', link)
@@ -79,16 +182,25 @@ def normalize_steam_profile_link(link):
             profile_type, profile_id = match.groups()
             if profile_type == 'id':
                 try:
+                    if is_stop_requested():
+                        logger.info("Stop requested; aborting vanity resolve for %s", profile_id)
+                        return None, None
                     vanity_url = f"http://api.steampowered.com/ISteamUser/ResolveVanityURL/v1/?key={STEAM_API_KEY}&vanityurl={profile_id}"
                     logger.debug("Resolving vanity URL for %s via %s", profile_id, vanity_url)
                     response = requests.get(vanity_url, timeout=10)
+                    if response.status_code == 429:
+                        logger.warning("Vanity resolve rate-limited for %s. Sleeping %ss", profile_id, STEAM_429_DELAY_SECONDS)
+                        time.sleep(STEAM_429_DELAY_SECONDS)
+                        return None, None
                     response.raise_for_status()
                     data = response.json()
                     if data.get('response', {}).get('success') == 1:
+                        logger.debug("Resolved vanity id=%s to steamid=%s", profile_id, data['response']['steamid'])
                         return data['response']['steamid'], profile_id
                 except Exception:
                     logger.exception("Failed to resolve vanity URL for %s", profile_id)
             else:
+                logger.debug("Direct numeric profile id detected: %s", profile_id)
                 return profile_id, profile_id
     logger.debug("Could not normalize link: %s", link)
     return None, None
@@ -419,98 +531,131 @@ async def hydrate_input_messages_from_discord(channel, file_path: str = INPUT_FI
 
 
 async def collect_runtime_messages_and_save(timeout_seconds: int = RUNTIME_INPUT_TIMEOUT_SECONDS) -> list[str]:
-    logger.info("Runtime input enabled. Enter multiple lines. Press Enter on empty line to finish.")
-    logger.info("If no input for %ss, it will fallback to %s", timeout_seconds, INPUT_FILE)
-
-    runtime_messages: list[str] = []
-
-    while True:
-        try:
-            line = await asyncio.wait_for(
-                asyncio.to_thread(input, "Input Steam link/message: "),
-                timeout=timeout_seconds
-            )
-        except asyncio.TimeoutError:
-            break
-        except Exception:
-            logger.exception("Failed to read runtime input")
-            break
-
-        line = (line or "").strip()
-        if not line:
-            break
-
-        if STEAM_LINK_PATTERN.search(line):
-            runtime_messages.append(line)
-        else:
-            logger.warning("Ignored invalid input (does not match Steam link format): %s", line)
-
-    runtime_messages = _normalize_messages(runtime_messages)
-    if runtime_messages:
-        save_input_messages(runtime_messages, INPUT_FILE)
-
-    return runtime_messages
+    logger.info("Runtime CLI input is disabled. Skipping interactive terminal input.")
+    return []
             
-def parse_runtime_input(raw: str) -> list[str]:
-    text = (raw or "").strip()
-    if not text:
-        return []
+async def process_profile_entry(profile_type: str, profile_id: str, group: str, semaphore: asyncio.Semaphore) -> dict:
+    full_link = f'https://steamcommunity.com/{profile_type}/{profile_id}'
+    logger.debug("Processing profile entry link=%s group=%s", full_link, group)
 
     try:
-        parsed = json.loads(text)
-        if isinstance(parsed, list):
-            return _normalize_runtime_items([str(x) for x in parsed])
-    except Exception:
-        pass
+        async with semaphore:
+            steam_id, _ = await asyncio.to_thread(normalize_steam_profile_link, full_link)
+            logger.debug("Normalized %s -> steam_id=%s", full_link, steam_id)
 
-    cleaned = text.strip().removeprefix("[").removesuffix("]")
-    parts = re.split(r"[\n,]+", cleaned)
-    return _normalize_runtime_items(parts)
+            if not steam_id:
+                logger.warning("Invalid/unresolvable Steam link: %s", full_link)
+                return {
+                    "steam_id": None,
+                    "group": group,
+                    "inv_total": 0.0,
+                    "inventory_details": "",
+                    "entries": [("invalid", f"Invalid or unresolvable Steam link: {full_link}")],
+                }
+
+            profile_status = await asyncio.to_thread(check_steam_profile, steam_id)
+            if not profile_status:
+                logger.warning("Could not retrieve profile status for steam_id=%s", steam_id)
+                return {
+                    "steam_id": steam_id,
+                    "group": group,
+                    "inv_total": 0.0,
+                    "inventory_details": "Could not retrieve inventory/profile data",
+                    "entries": [(
+                        "not_banned",
+                        f"Original ID: {full_link} (Steam ID: {steam_id}) - Could not retrieve data",
+                    )],
+                }
+
+            vac_banned = profile_status['VACBanned']
+            community_banned = profile_status['CommunityBanned']
+            game_ban_count = profile_status['NumberOfGameBans']
+            inventory_info, _ = await asyncio.to_thread(get_inventory_summary_with_status, steam_id, 730, 2, True)
+            inventory_state_line = "`Inventory:` " + inventory_info[:20] + "\n"
+
+            inv_total = parse_inventory_total(inventory_info)
+            logger.debug("Calculated $%.2f for group %s (profile=%s)", inv_total, group, steam_id)
+
+            profile_info = (
+                f"Original ID: {full_link}\n"
+                f"`Steam ID:` {steam_id}\n"
+                f"{inventory_state_line}"
+                f"```{inventory_info}```"
+            )
+
+            profile_info_not_banned = (
+                f"Original ID: {full_link}\n"
+                f"{inventory_state_line}"
+                f"```{inventory_info}```"
+            )
+
+            entries = []
+            if vac_banned:
+                entries.append(("vac", profile_info))
+            if community_banned:
+                entries.append(("community", profile_info))
+            if game_ban_count > 0:
+                entries.append(("game", f"{profile_info} - {game_ban_count} Game Ban(s)"))
+            if not (vac_banned or community_banned or game_ban_count > 0):
+                entries.append(("not_banned", profile_info_not_banned))
+
+            logger.debug(
+                "Completed profile entry steam_id=%s group=%s flags(vac=%s,community=%s,game_bans=%s)",
+                steam_id,
+                group,
+                vac_banned,
+                community_banned,
+                game_ban_count,
+            )
+
+            return {
+                "steam_id": steam_id,
+                "group": group,
+                "inv_total": inv_total,
+                "inventory_details": inventory_info,
+                "entries": entries,
+            }
+    except asyncio.CancelledError:
+        logger.debug("Profile processing for link=%s was cancelled", full_link)
+        return {
+            "steam_id": None,
+            "group": group,
+            "inv_total": 0.0,
+            "inventory_details": "",
+            "entries": [],
+        }
 
 
-async def get_runtime_messages(timeout_seconds: int = RUNTIME_INPUT_TIMEOUT_SECONDS) -> list[str]:
-    prompt = (
-        "Enter Steam links now (JSON list, comma-separated, or newline-separated). "
-        f"Waiting {timeout_seconds}s, then fallback to {INPUT_FILE}: "
-    )
+async def process_profile_entry_with_label(
+    profile_type: str,
+    profile_id: str,
+    group: str,
+    target_label: str,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, dict | Exception]:
     try:
-        raw = await asyncio.wait_for(asyncio.to_thread(input, prompt), timeout=timeout_seconds)
-    except asyncio.TimeoutError:
-        logger.info("No runtime input received within %ss", timeout_seconds)
-        return []
-    except Exception:
-        logger.exception("Failed to read runtime input")
-        return []
+        result = await process_profile_entry(profile_type, profile_id, group, semaphore)
+        return target_label, result
+    except Exception as e:
+        return target_label, e
 
-    messages = parse_runtime_input(raw)
-    if messages:
-        logger.info("Loaded %d input message(s) from runtime input", len(messages))
-    return messages
-
-
-async def load_messages_runtime_or_file(timeout_seconds: int = RUNTIME_INPUT_TIMEOUT_SECONDS) -> list[str]:
-    runtime_messages = await get_runtime_messages(timeout_seconds)
-    if runtime_messages:
-        return runtime_messages
-
-    return load_input_messages(INPUT_FILE)
-
-def _normalize_runtime_items(items: list[str]) -> list[str]:
-    normalized: list[str] = []
-    for item in items:
-        value = str(item).strip().strip('"').strip("'").rstrip(",")
-        if not value:
-            continue
-        if STEAM_LINK_PATTERN.search(value):
-            normalized.append(value)
-    return _normalize_messages(normalized)
-
-@tasks.loop(minutes=90)
+@tasks.loop(seconds=CHECK_LOOP_INTERVAL_SECONDS)
 async def check_steam():
-    logger.info("check_steam task started")
+    global _runtime_input_bootstrapped, _runtime_input_messages_cache, _bot_paused, _bot_running, _active_tasks
+
+    # Check if paused or stopped
+    if _bot_paused or not _bot_running:
+        logger.debug("Bot is paused or stopped, skipping check_steam iteration")
+        return
+
+    if not _runtime_input_bootstrapped:
+        _runtime_input_messages_cache = []
+        _runtime_input_bootstrapped = True
+        logger.info("Runtime CLI input disabled. Using %s and Discord attachment hydration only.", INPUT_FILE)
+
     for channel_id in CHANNEL_IDS:
         channel = bot.get_channel(channel_id)
-        logger.info("Processing channel %s", channel_id)
+        logger.debug("Processing channel %s", channel_id)
         vac_banned_accounts = {}
         community_banned_accounts = {}
         game_banned_accounts = {}
@@ -523,10 +668,10 @@ async def check_steam():
             logger.warning("Channel %s not found", channel_id)
             continue
 
-        await hydrate_input_messages_from_discord(channel, INPUT_FILE)
-        await delete_previous_bot_messages(channel)
+        input_messages = _runtime_input_messages_cache or load_input_messages()
+        if not input_messages:
+            input_messages = await hydrate_input_messages_from_discord(channel, INPUT_FILE)
 
-        input_messages = await collect_runtime_messages_and_save()
         if not input_messages:
             input_messages = load_input_messages()
 
@@ -534,58 +679,95 @@ async def check_steam():
             logger.warning("No input messages found from runtime input or %s", INPUT_FILE)
             continue
 
+        targets = []
+        target_labels = []
         for msg_idx, content in enumerate(input_messages, start=1):
             steam_links = re.findall(r'https?://steamcommunity\.com/(profiles|id)/(\w+)(?:/(\w+))?', content)
             if not steam_links:
                 continue
 
-            total_accounts_found += len(steam_links)
             logger.debug("Found %d steam links in input message #%d", len(steam_links), msg_idx)
-
             for profile_type, profile_id, group in steam_links:
-                group = group or "UNGROUPED"
-                full_link = f'https://steamcommunity.com/{profile_type}/{profile_id}'
+                resolved_group = group or "UNGROUPED"
+                targets.append((profile_type, profile_id, resolved_group))
+                target_labels.append(f"{profile_type}/{profile_id} [{resolved_group}]")
 
-                steam_id, original_id = await asyncio.to_thread(normalize_steam_profile_link, full_link)
-                logger.debug("Normalized %s -> steam_id=%s original=%s", full_link, steam_id, original_id)
+        if not targets:
+            logger.warning("No Steam links found in loaded input messages for channel %s", channel_id)
+            continue
 
-                if steam_id:
-                    profile_status = await asyncio.to_thread(check_steam_profile, steam_id)
-                    if profile_status:
-                        vac_banned = profile_status['VACBanned']
-                        community_banned = profile_status['CommunityBanned']
-                        game_ban_count = profile_status['NumberOfGameBans']
-                        inventory_info = await asyncio.to_thread(get_inventory_summary, steam_id, 730, 2, True)
+        reset_inventory_progress(target_labels)
+        total_accounts_found = len(targets)
 
-                        inv_total = parse_inventory_total(inventory_info)
-                        group_totals[group] = group_totals.get(group, 0.0) + inv_total
-                        logger.debug("Added $%.2f to group %s (profile=%s)", inv_total, group, steam_id)
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROFILE_CHECKS)
+        logger.debug(
+            "Processing %d Steam profiles for channel %s with concurrency=%d",
+            len(targets),
+            channel_id,
+            MAX_CONCURRENT_PROFILE_CHECKS,
+        )
+        tasks_batch = [
+            asyncio.create_task(
+                process_profile_entry_with_label(
+                    profile_type,
+                    profile_id,
+                    group,
+                    f"{profile_type}/{profile_id} [{group}]",
+                    semaphore,
+                )
+            )
+            for profile_type, profile_id, group in targets
+        ]
+        
+        # Track tasks so we can cancel them if needed
+        for task in tasks_batch:
+            _active_tasks.add(task)
+        
+        results = []
+        try:
+            for completed_task in asyncio.as_completed(tasks_batch):
+                target_label, result = await completed_task
+                if isinstance(result, dict):
+                    details = str(result.get("inventory_details", ""))
+                mark_inventory_processed(target_label, details)
+                results.append(result)
+        finally:
+            # Remove completed tasks
+            for task in tasks_batch:
+                _active_tasks.discard(task)
 
-                        profile_info = (
-                            f"Original ID: {full_link}\n"
-                            f"`Steam ID:` {steam_id}\n"
-                            f"```{inventory_info}```"
-                        )
+        active_steam_ids = set()
 
-                        profile_info_NotBanned = (
-                            f"Original ID: {full_link}\n"
-                            f"```{inventory_info}```"
-                        )
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error("Profile processing task failed: %r", result)
+                continue
 
-                        if vac_banned:
-                            add_to_group(vac_banned_accounts, group, profile_info)
-                        if community_banned:
-                            add_to_group(community_banned_accounts, group, profile_info)
-                        if game_ban_count > 0:
-                            add_to_group(game_banned_accounts, group, f"{profile_info} - {game_ban_count} Game Ban(s)")
-                        if not (vac_banned or community_banned or game_ban_count > 0):
-                            add_to_group(not_banned_accounts, group, profile_info_NotBanned)
-                    else:
-                        add_to_group(not_banned_accounts, group, f"Original ID: {full_link} (Steam ID: {steam_id}) - Could not retrieve data")
-                        logger.warning("Could not retrieve profile status for steam_id=%s", steam_id)
-                else:
-                    add_to_group(invalid_accounts, group, f"Invalid or unresolvable Steam link: {full_link}")
-                    logger.warning("Invalid/unresolvable Steam link: %s", full_link)
+            if result.get("steam_id"):
+                active_steam_ids.add(str(result.get("steam_id")))
+
+            group = result.get("group", "UNGROUPED")
+            group_totals[group] = group_totals.get(group, 0.0) + float(result.get("inv_total", 0.0))
+
+            for category, value in result.get("entries", []):
+                if category == "vac":
+                    add_to_group(vac_banned_accounts, group, value)
+                elif category == "community":
+                    add_to_group(community_banned_accounts, group, value)
+                elif category == "game":
+                    add_to_group(game_banned_accounts, group, value)
+                elif category == "not_banned":
+                    add_to_group(not_banned_accounts, group, value)
+                elif category == "invalid":
+                    add_to_group(invalid_accounts, group, value)
+
+        unchanged_ids = set(await asyncio.to_thread(get_unchanged_inventory_ids))
+        stale_unchanged_ids = [sid for sid in unchanged_ids if sid not in active_steam_ids]
+        if stale_unchanged_ids:
+            logger.info("Removing %d unchanged entries not present in current item list", len(stale_unchanged_ids))
+        for stale_sid in stale_unchanged_ids:
+            await asyncio.to_thread(remove_unchanged_inventory, stale_sid)
+            await asyncio.to_thread(remove_cache_entry, stale_sid)
 
         logger.info(
             "Channel %s summary: total_found=%d vac_groups=%d community_groups=%d game_groups=%d not_banned_groups=%d invalid_groups=%d",
@@ -594,6 +776,8 @@ async def check_steam():
             len(game_banned_accounts), len(not_banned_accounts),
             len(invalid_accounts)
         )
+
+        await delete_previous_bot_messages(channel)
 
         await send_grouped_embeds(channel, "VAC Banned Accounts", vac_banned_accounts, total_accounts_found)
         await send_grouped_embeds(channel, "Community Banned Accounts", community_banned_accounts, total_accounts_found)
@@ -605,4 +789,190 @@ async def check_steam():
             await send_totals_embed(channel, group_totals)
 
 logger.info("Entrypoint: starting bot")
+
+# Initialize GUI logging
+setup_gui_logging()
+
+# Create GUI window with callbacks
+def on_start_bot():
+    global _bot_running, _bot_paused
+    logger.info("Bot start requested via GUI")
+    set_stop_requested(False)
+    _bot_running = True
+    _bot_paused = False
+    logger.info("Starting check_steam loop from GUI")
+    try:
+        # Wait for bot event loop to be ready, then schedule the task
+        if _bot_ready.is_set():
+            asyncio.run_coroutine_threadsafe(
+                _start_check_steam(),
+                bot.loop
+            )
+        else:
+            logger.warning("Bot event loop not ready yet, retrying...")
+    except Exception as e:
+        logger.error("Failed to start check_steam: %s", e)
+
+async def _start_check_steam():
+    """Helper coroutine to start the check_steam task."""
+    try:
+        loop_task = getattr(check_steam, "_task", None)
+        if loop_task is not None and not loop_task.done() and not check_steam.is_running():
+            logger.info("Previous check_steam task still shutting down; waiting before start")
+            try:
+                await loop_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        check_steam.start()
+        logger.info("check_steam loop started successfully")
+    except RuntimeError as e:
+        if "already launched" in str(e).lower() or "already running" in str(e).lower():
+            logger.info("check_steam loop already running")
+        else:
+            logger.error("Error starting check_steam: %s", e)
+    except Exception as e:
+        logger.error("Error starting check_steam: %s", e)
+
+def on_stop_bot():
+    global _bot_running, _bot_paused
+    logger.info("Bot stop requested via GUI")
+    set_stop_requested(True)
+    _bot_running = False
+    _bot_paused = False
+    if check_steam.is_running():
+        logger.info("Stopping check_steam loop from GUI")
+        try:
+            # Schedule the stop on the bot's event loop
+            if _bot_ready.is_set():
+                asyncio.run_coroutine_threadsafe(
+                    _stop_check_steam(),
+                    bot.loop
+                )
+            else:
+                logger.warning("Bot event loop not ready yet")
+        except Exception as e:
+            logger.error("Failed to stop check_steam: %s", e)
+    else:
+        logger.info("check_steam loop not running")
+
+async def _stop_check_steam():
+    """Helper coroutine to stop the check_steam task."""
+    global _active_tasks, _bot_running
+    try:
+        set_stop_requested(True)
+        # Cancel all active profile processing tasks
+        tasks_to_cancel = list(_active_tasks)
+        logger.info("Cancelling %d active profile processing tasks", len(tasks_to_cancel))
+        for task in tasks_to_cancel:
+            if not task.done():
+                task.cancel()
+                
+        # Wait for all tasks to be cancelled
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+                
+        _active_tasks.clear()
+                
+        # Stop the check_steam loop
+        loop_task = getattr(check_steam, "_task", None)
+        if loop_task is not None and not loop_task.done():
+            check_steam.cancel()
+            try:
+                await loop_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        else:
+            check_steam.stop()
+
+        _bot_running = False
+        logger.info("check_steam loop stopped successfully, all worker tasks cancelled")
+    except Exception as e:
+        logger.error("Error stopping check_steam: %s", e)
+
+def on_pause_bot():
+    global _bot_paused
+    logger.info("Bot pause requested via GUI")
+    _bot_paused = True
+
+def on_resume_bot():
+    global _bot_paused
+    logger.info("Bot resume requested via GUI")
+    _bot_paused = False
+
+
+def on_restart_bot():
+    logger.info("Bot restart requested via GUI")
+    set_stop_requested(False)
+    try:
+        if _bot_ready.is_set():
+            asyncio.run_coroutine_threadsafe(
+                _restart_check_steam(),
+                bot.loop
+            )
+        else:
+            logger.warning("Bot event loop not ready yet")
+    except Exception as e:
+        logger.error("Failed to restart check_steam: %s", e)
+
+
+async def _restart_check_steam():
+    global _bot_running, _bot_paused
+    try:
+        if check_steam.is_running():
+            await _stop_check_steam()
+        set_stop_requested(False)
+        _bot_paused = False
+        _bot_running = True
+        await _start_check_steam()
+        if check_steam.is_running():
+            logger.info("check_steam loop restarted successfully")
+        else:
+            logger.warning("check_steam restart requested but loop is not running")
+    except Exception as e:
+        logger.error("Error restarting check_steam: %s", e)
+
+def on_force_update_prices():
+    logger.info("Force update prices requested via GUI")
+    try:
+        force_update_all_prices()
+        logger.info("Force update prices completed")
+    except Exception as e:
+        logger.error("Force update prices failed: %s", e)
+
+
+def on_reset_updated_flags():
+    logger.info("Reset updated flags requested via GUI (no-op)")
+    pass
+
+
+# Start GUI in a separate thread
+def run_gui():
+    global _gui_window, _gui_ready
+    logger.info("GUI thread starting")
+    _gui_window = create_gui_window(
+        on_start_bot=on_start_bot,
+        on_stop_bot=on_stop_bot,
+        on_pause_bot=on_pause_bot,
+        on_resume_bot=on_resume_bot,
+        on_restart_bot=on_restart_bot,
+        on_force_update_prices=on_force_update_prices,
+    )
+    _gui_ready = True
+    logger.info("GUI thread ready, mainloop starting")
+    _gui_window.mainloop()
+
+gui_thread = threading.Thread(target=run_gui, daemon=False)
+gui_thread.start()
+
+# Give GUI a moment to initialize before Discord connects
+logger.info("Waiting for GUI to initialize...")
+time.sleep(1)
+
+# Run the bot
+logger.info("Starting Discord bot connection")
 bot.run(BOT_TOKEN)

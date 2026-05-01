@@ -73,6 +73,7 @@ if /I "%~1"=="--freeze" (
   --hidden-import utils.config ^
   --hidden-import utils.Inventory ^
   --hidden-import utils.PriceChecker ^
+  --hidden-import utils.steam_rate_limiter ^
   BanChecker.py
 
 if errorlevel 1 goto :build_failed

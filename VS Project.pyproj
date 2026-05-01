@@ -32,6 +32,7 @@
   <ItemGroup>
     <Compile Include="BanChecker.py" />
     <Compile Include="utils\config.py" />
+    <Compile Include="utils\gui.py" />
     <Compile Include="utils\Inventory.py" />
     <Compile Include="utils\logger.py" />
     <Compile Include="utils\PriceChecker.py" />
@@ -41,12 +42,24 @@
     <Folder Include="utils\" />
   </ItemGroup>
   <ItemGroup>
+    <Content Include="APPLE_UI_CHANGES.md" />
+    <Content Include="ASYNC_FIX_NOTES.md" />
+    <Content Include="BEFORE_AFTER.md" />
     <Content Include="build_exe.bat" />
+    <Content Include="CHECKLIST.md" />
     <Content Include="config.json" />
     <Content Include="gitignore .gitignore" />
+    <Content Include="GUI_COLUMN_REMOVAL_REPORT.md" />
+    <Content Include="GUI_README.md" />
+    <Content Include="IMPLEMENTATION_COMPLETE.md" />
+    <Content Include="INDEX.md" />
     <Content Include="input_messages.json" />
     <Content Include="Procfile" />
+    <Content Include="QUICK_REFERENCE.md" />
     <Content Include="requirements.txt" />
+    <Content Include="UI_DESIGN_GUIDE.md" />
+    <Content Include="UI_VISUAL_GUIDE.md" />
+    <Content Include="UPDATE_FLAG_REMOVAL_REPORT.md" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
 </Project>
